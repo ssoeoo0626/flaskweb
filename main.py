@@ -73,16 +73,45 @@ def extract_page_text(page) -> str:
 
 
 def extract_tables_from_page(page) -> List[pd.DataFrame]:
-    raw_tables = page.extract_tables()
     tables = []
-    for raw in raw_tables:
+    settings_list = [
+        {
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "lines",
+            "intersection_tolerance": 5,
+            "snap_tolerance": 3,
+            "join_tolerance": 3,
+        },
+        {
+            "vertical_strategy": "text",
+            "horizontal_strategy": "text",
+            "intersection_tolerance": 5,
+            "text_x_tolerance": 2,
+            "text_y_tolerance": 2,
+        },
+        {
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "text",
+            "intersection_tolerance": 5,
+            "text_x_tolerance": 2,
+            "text_y_tolerance": 2,
+        },
+    ]
+
+    for settings in settings_list:
         try:
-            df = pd.DataFrame(raw)
-            df = clean_table(df)
-            if not df.empty and len(df.columns) >= 2 and len(df) >= 2:
-                tables.append(df)
+            raw_tables = page.extract_tables(settings)
+            for raw in raw_tables:
+                try:
+                    df = pd.DataFrame(raw)
+                    df = clean_table(df)
+                    if not df.empty and len(df.columns) >= 2 and len(df) >= 2:
+                        tables.append(df)
+                except Exception:
+                    continue
         except Exception:
             continue
+
     return tables
 
 
@@ -105,25 +134,59 @@ def find_candidate_pages(pdf_file, keywords: List[str]) -> List[Dict]:
     return results
 
 
+def parse_text_table_from_page(page, keywords: List[str]) -> Optional[pd.DataFrame]:
+    text = extract_page_text(page)
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+
+    records = []
+    current_section = ""
+
+    for line in lines:
+        lower = line.lower()
+
+        if lower in ["assets", "liabilities and stockholders' equity", "liabilities and stockholders’ equity"]:
+            current_section = line
+            continue
+
+        if line.endswith(":"):
+            current_section = line[:-1]
+            continue
+
+        # 계정명 + 숫자 2개 패턴 (예: Cash and cash equivalents 520,821 482,047)
+        m = re.match(r"^(.*?)(\(?\$?[\d,]+\)?)[ ]+(\(?\$?[\d,]+\)?)$", line)
+        if m:
+            account = normalize_text(m.group(1))
+            v1 = normalize_text(m.group(2)).replace("$", "").replace(",", "").replace("(", "-").replace(")", "")
+            v2 = normalize_text(m.group(3)).replace("$", "").replace(",", "").replace("(", "-").replace(")", "")
+            records.append({
+                "section": current_section,
+                "account": account,
+                "value_1": v1,
+                "value_2": v2,
+            })
+
+    if not records:
+        return None
+
+    df = pd.DataFrame(records)
+    df = clean_table(df)
+
+    text_blob = "\n".join(df.astype(str).fillna("").agg(" ".join, axis=1).tolist())
+    if keyword_hit_score(text_blob, keywords) == 0:
+        return None
+
+    return df
+
+
 def extract_best_table_from_page(pdf_file, page_number: int, keywords: List[str]) -> Tuple[Optional[pd.DataFrame], List[pd.DataFrame]]:
     with pdfplumber.open(pdf_file) as pdf:
         page = pdf.pages[page_number - 1]
         tables = extract_tables_from_page(page)
-        if not tables:
-            return None, []
 
         scored = []
         for df in tables:
             text_blob = "\n".join(
                 [" ".join(map(str, df.columns.tolist()))] +
-                [" ".join(map(str, row)) for row in df.astype(str).values.tolist()]
-            )
-            score = keyword_hit_score(text_blob, keywords)
-            scored.append((score, df))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        best_df = scored[0][1]
-        return best_df, [x[1] for x in scored]
 
 
 def try_merge_tables_vertically(tables: List[pd.DataFrame]) -> pd.DataFrame:
