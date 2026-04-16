@@ -7,7 +7,7 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
-st.set_page_config(page_title="PDF 추출기 + 어닝콜 분석", layout="wide")
+st.set_page_config(page_title="리포트 자동화 대시보드", layout="wide")
 
 
 # =========================================================
@@ -24,6 +24,19 @@ def normalize_text(text: str) -> str:
 
 def dataframe_to_tsv(df: pd.DataFrame) -> str:
     return df.to_csv(sep="\t", index=False)
+
+
+def safe_float(value):
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s == "":
+        return None
+    s = s.replace(",", "").replace("$", "").replace("%", "").replace("(", "-").replace(")", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 
 # =========================================================
@@ -56,7 +69,6 @@ def promote_first_row_to_header(df: pd.DataFrame) -> pd.DataFrame:
     if non_empty_ratio >= 0.5:
         new_cols = []
         seen = {}
-
         for i, col in enumerate(first_row):
             col = col if col else f"col_{i+1}"
             seen[col] = seen.get(col, 0) + 1
@@ -279,7 +291,7 @@ def filter_by_sector(result_df: pd.DataFrame, sector_keywords: List[str]) -> Dic
 
 
 # =========================================================
-# 어닝콜 분석 유틸
+# 텍스트 분석 유틸
 # =========================================================
 DEFAULT_STOPWORDS = {
     "the", "and", "of", "to", "in", "a", "for", "on", "is", "that", "with", "as",
@@ -319,8 +331,7 @@ def extract_text_from_uploaded_doc(uploaded_file) -> str:
 
 def tokenize_english_text(text: str) -> List[str]:
     text = text.lower()
-    tokens = re.findall(r"[a-zA-Z][a-zA-Z\-']{1,}", text)
-    return tokens
+    return re.findall(r"[a-zA-Z][a-zA-Z\-']{1,}", text)
 
 
 def build_stopwords(custom_stopwords_text: str) -> set:
@@ -361,8 +372,7 @@ def build_kwic(text: str, query: str, window: int = 80, limit: int = 20) -> pd.D
 
 def split_paragraphs(text: str) -> List[str]:
     parts = re.split(r"\n\s*\n", text)
-    parts = [p.strip() for p in parts if p.strip()]
-    return parts
+    return [p.strip() for p in parts if p.strip()]
 
 
 def summarize_paragraph(paragraph: str, stopwords: set, max_sentences: int = 2) -> str:
@@ -383,19 +393,17 @@ def summarize_paragraph(paragraph: str, stopwords: set, max_sentences: int = 2) 
 
     scored.sort(key=lambda x: x[0], reverse=True)
     top_sentences = [s for _, s in scored[:max_sentences]]
-
     ordered = [s for s in sentences if s in top_sentences]
     return " ".join(ordered)
 
 
-def build_paragraph_summary_df(text: str, stopwords: set, max_paragraphs: int = 30) -> pd.DataFrame:
+def build_paragraph_summary_df(text: str, stopwords: set, max_paragraphs: int = 15) -> pd.DataFrame:
     paragraphs = split_paragraphs(text)
 
     rows = []
     for i, para in enumerate(paragraphs[:max_paragraphs], start=1):
         summary = summarize_paragraph(para, stopwords, max_sentences=2)
         token_count = len(tokenize_english_text(para))
-
         rows.append(
             {
                 "paragraph_no": i,
@@ -409,6 +417,178 @@ def build_paragraph_summary_df(text: str, stopwords: set, max_paragraphs: int = 
 
 
 # =========================================================
+# 리포트 탭 유틸
+# =========================================================
+def load_financial_file(uploaded_file) -> pd.DataFrame:
+    if uploaded_file is None:
+        return pd.DataFrame()
+
+    name = uploaded_file.name.lower()
+
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(uploaded_file)
+
+    return pd.DataFrame()
+
+
+def standardize_financial_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or len(df.columns) < 2:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # 첫 3개 컬럼 기준으로 단순 표준화
+    col_names = list(df.columns)
+
+    metric_col = col_names[0]
+    current_col = col_names[1]
+    prior_col = col_names[2] if len(col_names) >= 3 else None
+
+    out = pd.DataFrame()
+    out["metric"] = df[metric_col].astype(str).map(normalize_text)
+    out["current"] = df[current_col]
+
+    if prior_col:
+        out["prior"] = df[prior_col]
+    else:
+        out["prior"] = None
+
+    out = out.dropna(subset=["metric"])
+    out = out[out["metric"].astype(str).str.strip() != ""]
+    out = out.reset_index(drop=True)
+    return out
+
+
+def find_metric_value(fin_df: pd.DataFrame, metric_keywords: List[str]) -> Optional[Dict]:
+    if fin_df.empty:
+        return None
+
+    for _, row in fin_df.iterrows():
+        metric_name = str(row["metric"]).lower()
+        if any(k in metric_name for k in metric_keywords):
+            current = safe_float(row["current"])
+            prior = safe_float(row["prior"]) if "prior" in row else None
+            return {
+                "metric": row["metric"],
+                "current": current,
+                "prior": prior,
+            }
+    return None
+
+
+def build_financial_highlights(fin_df: pd.DataFrame) -> List[str]:
+    metrics_to_find = {
+        "revenue": ["revenue", "sales", "매출"],
+        "operating income": ["operating income", "operating profit", "영업이익"],
+        "ebitda": ["ebitda"],
+        "net income": ["net income", "순이익", "net earnings"],
+        "cash": ["cash", "현금"],
+        "debt": ["debt", "borrowings", "차입금"],
+        "free cash flow": ["free cash flow", "fcf"],
+    }
+
+    lines = []
+
+    for label, keys in metrics_to_find.items():
+        found = find_metric_value(fin_df, keys)
+        if found is None:
+            continue
+
+        current = found["current"]
+        prior = found["prior"]
+
+        if current is None:
+            continue
+
+        if prior is not None and prior != 0:
+            diff_pct = (current - prior) / abs(prior) * 100
+            direction = "증가" if diff_pct > 0 else "감소" if diff_pct < 0 else "유지"
+            lines.append(
+                f"{found['metric']}: {current:,.1f} (전기/전년 대비 {direction}, {diff_pct:+.1f}%)"
+            )
+        else:
+            lines.append(f"{found['metric']}: {current:,.1f}")
+
+    return lines
+
+
+def classify_call_topics(keyword_df: pd.DataFrame) -> Dict[str, List[str]]:
+    topic_map = {
+        "실적/수익성": ["revenue", "margin", "profit", "ebitda", "income"],
+        "가이던스/전망": ["guidance", "outlook", "expect", "forecast"],
+        "수요/시장": ["demand", "consumer", "traffic", "attendance", "box", "office"],
+        "비용/현금": ["cost", "expense", "cash", "debt", "capex", "liquidity"],
+        "전략/확장": ["growth", "strategy", "expansion", "content", "premium", "network"],
+    }
+
+    found_topics = {k: [] for k in topic_map}
+
+    if keyword_df.empty:
+        return found_topics
+
+    for _, row in keyword_df.iterrows():
+        kw = str(row["keyword"]).lower()
+        for topic, words in topic_map.items():
+            if any(w in kw for w in words):
+                found_topics[topic].append(kw)
+
+    return found_topics
+
+
+def build_report_sections(
+    fin_df: pd.DataFrame,
+    keyword_df: pd.DataFrame,
+    paragraph_df: pd.DataFrame
+) -> Dict[str, List[str]]:
+    overview = []
+    financial_highlights = build_financial_highlights(fin_df)
+
+    if financial_highlights:
+        overview.append("재무지표상 핵심 수치의 방향성은 전반적으로 확인 가능.")
+    if not keyword_df.empty:
+        overview.append("어닝콜에서는 반복 언급 키워드를 통해 경영진의 강조 포인트를 확인 가능.")
+
+    call_takeaways = []
+    if not paragraph_df.empty:
+        for _, row in paragraph_df.head(3).iterrows():
+            summary = str(row["summary"]).strip()
+            if summary:
+                call_takeaways.append(summary)
+
+    topic_map = classify_call_topics(keyword_df)
+    risks = []
+    opportunities = []
+
+    if topic_map.get("가이던스/전망"):
+        risks.append("가이던스 관련 언급 빈도가 높아 향후 실적 방향성에 대한 시장 민감도가 높을 수 있음.")
+    if topic_map.get("비용/현금"):
+        risks.append("비용·현금 관련 언급은 수익성 및 재무 여력에 대한 점검 필요성을 시사.")
+    if topic_map.get("전략/확장"):
+        opportunities.append("전략·확장 관련 키워드 비중은 중장기 성장 드라이버 확보 의지를 시사.")
+    if topic_map.get("실적/수익성"):
+        opportunities.append("실적·수익성 관련 언급이 많을 경우, 핵심 지표 개선 여부가 valuation의 중심이 될 가능성.")
+
+    final_view = []
+    if financial_highlights or call_takeaways:
+        final_view.append("숫자와 코멘트를 함께 보면, 실적의 방향성과 경영진 톤을 동시에 점검하는 접근이 유효.")
+    if not final_view:
+        final_view.append("입력 데이터가 제한적이어서 판단 초안은 보수적으로 해석할 필요가 있음.")
+
+    return {
+        "overview": overview,
+        "financial_highlights": financial_highlights,
+        "call_takeaways": call_takeaways,
+        "risks": risks,
+        "opportunities": opportunities,
+        "final_view": final_view,
+    }
+
+
+# =========================================================
 # 세션 상태
 # =========================================================
 if "show_sector_box" not in st.session_state:
@@ -418,7 +598,9 @@ if "show_sector_box" not in st.session_state:
 # =========================================================
 # 탭 구성
 # =========================================================
-tab_pdf, tab_earnings = st.tabs(["PDF 표 추출", "어닝콜 키워드 분석"])
+tab_pdf, tab_earnings, tab_report = st.tabs(
+    ["PDF 표 추출", "어닝콜 키워드 분석", "종합 리포트"]
+)
 
 
 # =========================================================
@@ -437,7 +619,7 @@ with tab_pdf:
 assets
 total assets
 retained earnings""",
-            help="줄바꿈으로 여러 키워드를 넣어주세요. 예: balance sheets / revenue / operating activities",
+            help="줄바꿈으로 여러 키워드를 넣어주세요.",
             key="pdf_keyword_input",
         )
 
@@ -463,10 +645,7 @@ retained earnings""",
                 "현금흐름표": ["operating activities", "investing activities", "financing activities"],
             }
 
-            default_sector_text = ""
-            if sector_mode in preset_map:
-                default_sector_text = "\n".join(preset_map[sector_mode])
-
+            default_sector_text = "\n".join(preset_map.get(sector_mode, []))
             sector_text = st.text_area(
                 "섹터 입력",
                 value=default_sector_text,
@@ -521,7 +700,6 @@ retained earnings""",
                         result_df = promote_first_row_to_header(result_df)
 
                     result_df = clean_table(result_df)
-
                     st.subheader("추출 결과")
 
                     if sector_keywords:
@@ -546,18 +724,9 @@ retained earnings""",
                     st.subheader("엑셀 붙여넣기용 TSV")
                     st.code(tsv_text, language=None)
 
-                    csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        label="CSV 다운로드",
-                        data=csv_bytes,
-                        file_name=f"extracted_table_p{selected_page}.csv",
-                        mime="text/csv",
-                        key="pdf_csv_download",
-                    )
-
 
 # =========================================================
-# 탭 2: 어닝콜 키워드 분석 + 문단별 요약
+# 탭 2: 어닝콜 키워드 분석
 # =========================================================
 with tab_earnings:
     st.title("어닝콜 키워드 분석")
@@ -594,7 +763,7 @@ company""",
 
         min_word_len = st.slider("최소 단어 길이", 2, 8, 3, key="earnings_min_word_len")
         top_n = st.slider("Top N", 10, 50, 20, key="earnings_top_n")
-        max_paragraphs = st.slider("문단 요약 개수", 5, 50, 20, key="earnings_max_paragraphs")
+        max_paragraphs = st.slider("문단 요약 개수", 5, 30, 12, key="earnings_max_paragraphs")
 
     file_text = extract_text_from_uploaded_doc(transcript_file) if transcript_file else ""
     full_text = transcript_text.strip() if transcript_text.strip() else file_text.strip()
@@ -652,13 +821,6 @@ company""",
 
         st.divider()
 
-        st.subheader("복사용 Top Keywords")
-        if not keyword_df.empty:
-            keyword_lines = "\n".join(
-                [f"{row.keyword}\t{row.count}" for row in keyword_df.itertuples(index=False)]
-            )
-            st.code(keyword_lines, language=None)
-
         st.subheader("원문 검색")
         search_query = st.text_input("찾을 단어/문구", key="earnings_search_query")
 
@@ -668,9 +830,107 @@ company""",
                 st.info("검색 결과가 없습니다.")
             else:
                 st.dataframe(kwic_df, use_container_width=True)
-
-        with st.expander("원문 전체 보기"):
-            st.text(full_text[:50000])
-
     else:
         st.info("텍스트를 붙여넣거나 txt/pdf transcript 파일을 업로드하세요.")
+
+
+# =========================================================
+# 탭 3: 종합 리포트
+# =========================================================
+with tab_report:
+    st.title("종합 리포트")
+    st.caption("재무숫자와 어닝콜 내용을 함께 넣으면 IR/전략팀 스타일 1페이지 리포트 초안을 생성합니다.")
+
+    left, right = st.columns(2)
+
+    with left:
+        st.subheader("재무숫자 입력")
+        fin_file = st.file_uploader(
+            "재무 CSV/XLSX 업로드",
+            type=["csv", "xlsx", "xls"],
+            key="report_financial_file"
+        )
+        st.caption("첫 번째 열은 metric, 두 번째 열은 current, 세 번째 열은 prior로 인식합니다.")
+
+    with right:
+        st.subheader("어닝콜 입력")
+        report_text_input = st.text_area(
+            "어닝콜 텍스트 붙여넣기",
+            height=220,
+            key="report_text_input"
+        )
+        report_text_file = st.file_uploader(
+            "또는 transcript 파일 업로드 (txt/pdf)",
+            type=["txt", "pdf"],
+            key="report_text_file"
+        )
+
+    generate_report = st.button("리포트 생성", key="generate_report_button")
+
+    if generate_report:
+        # 재무 입력
+        fin_raw = load_financial_file(fin_file) if fin_file else pd.DataFrame()
+        fin_df = standardize_financial_df(fin_raw)
+
+        # 텍스트 입력
+        report_file_text = extract_text_from_uploaded_doc(report_text_file) if report_text_file else ""
+        report_full_text = report_text_input.strip() if report_text_input.strip() else report_file_text.strip()
+
+        custom_stopwords_text = """operator
+question
+answer
+quarter
+year
+company"""
+        stopwords = build_stopwords(custom_stopwords_text)
+
+        if report_full_text:
+            tokens = tokenize_english_text(report_full_text)
+            keyword_df = get_top_keywords(tokens, stopwords, min_len=3, top_n=20)
+            paragraph_df = build_paragraph_summary_df(report_full_text, stopwords, max_paragraphs=10)
+        else:
+            keyword_df = pd.DataFrame(columns=["keyword", "count"])
+            paragraph_df = pd.DataFrame(columns=["paragraph_no", "summary", "original_text", "token_count"])
+
+        sections = build_report_sections(fin_df, keyword_df, paragraph_df)
+
+        st.divider()
+        st.subheader("1페이지 리포트 초안")
+
+        report_blocks = []
+
+        def write_block(title: str, items: List[str]):
+            st.markdown(f"### {title}")
+            if items:
+                for item in items:
+                    st.write(f"- {item}")
+                    report_blocks.append(f"- {item}")
+            else:
+                st.write("- 입력 데이터 기준으로 유의미한 내용이 제한적입니다.")
+                report_blocks.append("- 입력 데이터 기준으로 유의미한 내용이 제한적입니다.")
+            report_blocks.append("")
+
+        write_block("Overview", sections["overview"])
+        write_block("Financial Highlights", sections["financial_highlights"])
+        write_block("Call Takeaways", sections["call_takeaways"])
+        write_block("Risks", sections["risks"])
+        write_block("Opportunities", sections["opportunities"])
+        write_block("Final View", sections["final_view"])
+
+        st.divider()
+
+        st.subheader("복사용 리포트")
+        report_text = "\n".join(report_blocks)
+        st.code(report_text, language=None)
+
+        if not fin_df.empty:
+            with st.expander("재무 입력 데이터 확인"):
+                st.dataframe(fin_df, use_container_width=True)
+
+        if not keyword_df.empty:
+            with st.expander("콜 키워드 확인"):
+                st.dataframe(keyword_df, use_container_width=True)
+
+        if not paragraph_df.empty:
+            with st.expander("콜 문단 요약 확인"):
+                st.dataframe(paragraph_df[["paragraph_no", "summary"]], use_container_width=True)
