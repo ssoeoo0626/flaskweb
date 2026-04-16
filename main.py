@@ -112,29 +112,28 @@ def extract_tables_from_page(page) -> List[pd.DataFrame]:
         except Exception:
             continue
 
-    return tables
+    return tablesegy": "text",
+            "intersection_tolerance": 5,
+            "text_x_tolerance": 2,
+            "text_y_tolerance": 2,
+        },
+        {
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "text",
+            "intersection_tolerance": 5,
+            "text_x_tolerance": 2,
+            "text_y_tolerance": 2,
+        },
+    ]
 
-
-def find_candidate_pages(pdf_file, keywords: List[str]) -> List[Dict]:
-    results = []
-    with pdfplumber.open(pdf_file) as pdf:
-        for idx, page in enumerate(pdf.pages):
-            text = extract_page_text(page)
-            score = keyword_hit_score(text, keywords)
-            if score > 0:
-                snippet = text[:500]
-                results.append(
-                    {
-                        "page_number": idx + 1,
-                        "score": score,
-                        "snippet": snippet,
-                    }
-                )
-    results.sort(key=lambda x: (-x["score"], x["page_number"]))
-    return results
-
-
-def parse_text_table_from_page(page, keywords: List[str]) -> Optional[pd.DataFrame]:
+    for settings in settings_list:
+        try:
+            raw_tables = page.extract_tables(settings)
+            for raw in raw_tables:
+                try:
+                    df = pd.DataFrame(raw)
+                    df = clean_table(df)
+                    if not df.empty and len(df.codef parse_text_table_from_page(page, keywords: List[str]) -> Optional[pd.DataFrame]:
     text = extract_page_text(page)
     lines = [line.strip() for line in text.split("\n") if line.strip()]
 
@@ -187,18 +186,91 @@ def extract_best_table_from_page(pdf_file, page_number: int, keywords: List[str]
         for df in tables:
             text_blob = "\n".join(
                 [" ".join(map(str, df.columns.tolist()))] +
+                [" ".join(map(str, row)) for row in df.astype(str).values.tolist()]
+            )
+            score = keyword_hit_score(text_blob, keywords)
+            scored.append((score, df))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        if scored and scored[0][0] > 0:
+            return scored[bda x: (-x["score"], x["page_number"]))
+    return results
+
+
+def parse_text_table_from_page(page, keywords: List[str]) -> Optional[pd.DataFrame]:
+    text = extract_page_text(page)
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+
+    records = []
+    current_section = ""
+
+    for line in lines:
+        lower = line.lower()
+
+        if lower in ["assets", "liabilities and stockholders' equity", "liabilities and stockholders’ equity"]:
+            current_section = line
+            continue
+
+        if line.endswith(":"):
+            current_section = line[:-1]
+            continue
+
+        m = re.match(r"^(.*?)(\(?\$?[\d,]+\)?)[ ]+(\(?\$?[\d,]+\)?)$", line)
+        if m:
+            account = normalize_text(m.group(1))
+            v1 = normalize_text(m.group(2)).replace("$", "").replace(",", "").replace("(", "-").replace(")", "")
+            v2 = normalize_text(m.group(3)).replace("$", "").replace(",", "").replace("(", "-").replace(")", "")
+            records.append({
+                "section": current_section,
+                "account": account,
+                "value_1": v1,
+                "value_2": v2,
+            })
+
+    if not records:
+        return None
+
+    df = pd.DataFrame(records)
+    df = clean_table(df)
+    text_blob = "\n".join(df.astype(str).fillna("").agg(" ".join, axis=1).tolist())
+    if keyword_hit_score(text_blob, keywords) == 0:
+        return None
+    return df
+
+
+def extract_best_table_from_page(pdf_file, page_number: int, keywords: List[str]) -> Tuple[Optional[pd.DataFrame], List[pd.DataFrame]]:
+    with pdfplumber.open(pdf_file) as pdf:
+        page = pdf.pages[page_number - 1]
+        tables = extract_tables_from_page(page)
+
+        scored = []
+        for df in tables:
+            text_blob = "\n".join(
+                [" ".join(map(str, df.columns.tolist()))] +
+                [" ".join(map(str, row)) for row in df.astype(str).values.tolist()]
+            )
+            score = keyword_hit_score(text_blob, keywords)
+            scored.append((score, df))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        if scored and scored[0][0] > 0:
+            best_df = scored[0][1]
+            return best_df, [x[1] for x in scored]
+
+        fallback_df = parse_text_table_from_page(page, keywords)
+        if fallback_df is not None:
+            return fallback_df, [fallback_df]
+
+        return None, []
 
 
 def try_merge_tables_vertically(tables: List[pd.DataFrame]) -> pd.DataFrame:
     if not tables:
         return pd.DataFrame()
 
-    normalized = []
-    for df in tables:
-        temp = promote_first_row_to_header(df)
-        normalized.append(temp)
-
-    base_cols = list(normalized[0].columns)
+   se_cols = list(normalized[0].columns)
     aligned = []
     for df in normalized:
         if len(df.columns) == len(base_cols):
