@@ -8,14 +8,14 @@ import streamlit as st
 
 st.set_page_config(page_title="PDF 키워드 기반 표 추출기", layout="wide")
 
+
 # -----------------------------
 # 유틸
 # -----------------------------
-
 def normalize_text(text: str) -> str:
-    if not text:
+    if text is None:
         return ""
-    text = text.replace("\xa0", " ")
+    text = str(text).replace("\xa0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n+", "\n", text)
     return text.strip()
@@ -31,9 +31,8 @@ def clean_table(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(how="all").dropna(axis=1, how="all")
     df = df.fillna("")
     df.columns = [str(c).strip() if c is not None else "" for c in df.columns]
-    df = df.applymap(lambda x: normalize_text(str(x)) if x is not None else "")
+    df = df.applymap(lambda x: normalize_text(x) if x is not None else "")
 
-    # 완전히 빈 행 제거
     mask = df.apply(lambda row: any(str(v).strip() for v in row), axis=1)
     df = df.loc[mask].reset_index(drop=True)
     return df
@@ -42,20 +41,25 @@ def clean_table(df: pd.DataFrame) -> pd.DataFrame:
 def promote_first_row_to_header(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
+
     first_row = [str(x).strip() for x in df.iloc[0].tolist()]
     non_empty_ratio = sum(bool(x) for x in first_row) / max(len(first_row), 1)
+
     if non_empty_ratio >= 0.5:
         new_cols = []
         seen = {}
+
         for i, col in enumerate(first_row):
             col = col if col else f"col_{i+1}"
             seen[col] = seen.get(col, 0) + 1
             if seen[col] > 1:
                 col = f"{col}_{seen[col]}"
             new_cols.append(col)
+
         out = df.iloc[1:].reset_index(drop=True).copy()
         out.columns = new_cols
         return out
+
     return df
 
 
@@ -66,7 +70,6 @@ def dataframe_to_tsv(df: pd.DataFrame) -> str:
 # -----------------------------
 # PDF 분석
 # -----------------------------
-
 def extract_page_text(page) -> str:
     text = page.extract_text() or ""
     return normalize_text(text)
@@ -74,6 +77,7 @@ def extract_page_text(page) -> str:
 
 def extract_tables_from_page(page) -> List[pd.DataFrame]:
     tables = []
+
     settings_list = [
         {
             "vertical_strategy": "lines",
@@ -111,47 +115,117 @@ def extract_tables_from_page(page) -> List[pd.DataFrame]:
                     continue
         except Exception:
             continue
+
     return tables
 
 
 def find_candidate_pages(pdf_file, keywords: List[str]) -> List[Dict]:
     results = []
+
     with pdfplumber.open(pdf_file) as pdf:
         for idx, page in enumerate(pdf.pages):
             text = extract_page_text(page)
             score = keyword_hit_score(text, keywords)
+
             if score > 0:
-                snippet = text[:500]
                 results.append(
                     {
                         "page_number": idx + 1,
                         "score": score,
-                        "snippet": snippet,
+                        "snippet": text[:500],
                     }
                 )
+
     results.sort(key=lambda x: (-x["score"], x["page_number"]))
     return results
 
 
-def extract_best_table_from_page(pdf_file, page_number: int, keywords: List[str]) -> Tuple[Optional[pd.DataFrame], List[pd.DataFrame]]:
+def parse_text_table_from_page(page, keywords: List[str]) -> Optional[pd.DataFrame]:
+    """
+    표 선 기반 추출이 실패할 때,
+    재무표 같은 '계정명 + 숫자 2개' 구조를 텍스트에서 직접 파싱
+    """
+    text = extract_page_text(page)
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+
+    records = []
+    current_section = ""
+
+    for line in lines:
+        lower = line.lower()
+
+        if lower in [
+            "assets",
+            "liabilities and stockholders' equity",
+            "liabilities and stockholders’ equity",
+        ]:
+            current_section = line
+            continue
+
+        if line.endswith(":"):
+            current_section = line[:-1]
+            continue
+
+        # 예:
+        # Cash and cash equivalents $ 520,821 $ 482,047
+        # Revenue 356,999 315,574
+        match = re.match(r"^(.*?)(\(?\$?[\d,]+\)?)[ ]+(\(?\$?[\d,]+\)?)$", line)
+        if match:
+            account = normalize_text(match.group(1))
+            value_1 = normalize_text(match.group(2)).replace("$", "").replace(",", "").replace("(", "-").replace(")", "")
+            value_2 = normalize_text(match.group(3)).replace("$", "").replace(",", "").replace("(", "-").replace(")", "")
+
+            records.append(
+                {
+                    "section": current_section,
+                    "account": account,
+                    "value_1": value_1,
+                    "value_2": value_2,
+                }
+            )
+
+    if not records:
+        return None
+
+    df = pd.DataFrame(records)
+    df = clean_table(df)
+
+    text_blob = "\n".join(df.astype(str).fillna("").agg(" ".join, axis=1).tolist())
+    if keyword_hit_score(text_blob, keywords) == 0:
+        return None
+
+    return df
+
+
+def extract_best_table_from_page(
+    pdf_file, page_number: int, keywords: List[str]
+) -> Tuple[Optional[pd.DataFrame], List[pd.DataFrame]]:
     with pdfplumber.open(pdf_file) as pdf:
         page = pdf.pages[page_number - 1]
+
+        # 1차: 표 선 / 텍스트 정렬 기반 추출
         tables = extract_tables_from_page(page)
-        if not tables:
-            return None, []
 
         scored = []
         for df in tables:
             text_blob = "\n".join(
-                [" ".join(map(str, df.columns.tolist()))] +
-                [" ".join(map(str, row)) for row in df.astype(str).values.tolist()]
+                [" ".join(map(str, df.columns.tolist()))]
+                + [" ".join(map(str, row)) for row in df.astype(str).values.tolist()]
             )
             score = keyword_hit_score(text_blob, keywords)
             scored.append((score, df))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        best_df = scored[0][1]
-        return best_df, [x[1] for x in scored]
+
+        if scored and scored[0][0] > 0:
+            return scored[0][1], [x[1] for x in scored]
+
+        # 2차: 텍스트 fallback
+        fallback_df = parse_text_table_from_page(page, keywords)
+        if fallback_df is not None:
+            return fallback_df, [fallback_df]
+
+        return None, []
 
 
 def try_merge_tables_vertically(tables: List[pd.DataFrame]) -> pd.DataFrame:
@@ -165,11 +239,12 @@ def try_merge_tables_vertically(tables: List[pd.DataFrame]) -> pd.DataFrame:
 
     base_cols = list(normalized[0].columns)
     aligned = []
+
     for df in normalized:
         if len(df.columns) == len(base_cols):
-            df = df.copy()
-            df.columns = base_cols
-            aligned.append(df)
+            copied = df.copy()
+            copied.columns = base_cols
+            aligned.append(copied)
         else:
             aligned.append(df)
 
@@ -184,18 +259,19 @@ def try_merge_tables_vertically(tables: List[pd.DataFrame]) -> pd.DataFrame:
 # -----------------------------
 # UI
 # -----------------------------
-
 st.title("PDF 키워드 기반 표 추출기")
 st.caption("PDF를 올리고 키워드를 넣으면 관련 페이지를 찾고, 표를 뽑아 TSV로 복사할 수 있습니다.")
 
 with st.sidebar:
     st.header("설정")
+
     keyword_input = st.text_area(
         "키워드 입력",
-        value="revenue\ngoodwill\ninstallations",
-        help="줄바꿈으로 여러 키워드를 넣어주세요. 예: revenue / EBITDA / screen / installations"
+        value="balance sheets\nassets\ntotal assets\nretained earnings",
+        help="줄바꿈으로 여러 키워드를 넣어주세요. 예: balance sheets / revenue / operating activities",
     )
-    promote_header = st.checkbox("첫 행을 헤더로 승격", value=True)
+
+    promote_header = st.checkbox("첫 행을 헤더로 승격", value=False)
     allow_multi_merge = st.checkbox("후보 표 여러 개 세로 병합 시도", value=False)
 
 uploaded_file = st.file_uploader("PDF 업로드", type=["pdf"])
@@ -218,15 +294,22 @@ if uploaded_file:
             candidate_df = pd.DataFrame(candidate_pages)
             st.dataframe(candidate_df, use_container_width=True)
 
-            page_options = [f"p.{row['page_number']} | score={row['score']}" for _, row in candidate_df.iterrows()]
+            page_options = [
+                f"p.{row['page_number']} | score={row['score']}"
+                for _, row in candidate_df.iterrows()
+            ]
             selected_label = st.selectbox("분석할 페이지 선택", page_options)
             selected_page = int(re.search(r"p\.(\d+)", selected_label).group(1))
 
             with st.spinner("표를 추출 중입니다..."):
-                best_df, all_tables = extract_best_table_from_page(io.BytesIO(pdf_bytes), selected_page, keywords)
+                best_df, all_tables = extract_best_table_from_page(
+                    io.BytesIO(pdf_bytes),
+                    selected_page,
+                    keywords,
+                )
 
             if best_df is None:
-                st.warning("이 페이지에서 추출 가능한 표를 찾지 못했습니다. PDF가 이미지형이면 OCR 기반 보강이 필요합니다.")
+                st.warning("이 페이지에서 표 선 기반 추출은 실패했고, 텍스트 파싱으로도 적절한 표를 만들지 못했습니다.")
             else:
                 if allow_multi_merge and len(all_tables) >= 2:
                     result_df = try_merge_tables_vertically(all_tables)
@@ -242,43 +325,43 @@ if uploaded_file:
                 st.dataframe(result_df, use_container_width=True)
 
                 tsv_text = dataframe_to_tsv(result_df)
+
                 st.subheader("엑셀 붙여넣기용 TSV")
-                st.text_area("아래 내용을 복사해서 Excel에 붙여넣으세요", value=tsv_text, height=250)
+                st.text_area(
+                    "아래 내용을 복사해서 Excel에 붙여넣으세요",
+                    value=tsv_text,
+                    height=250,
+                )
 
                 csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
+
                 st.download_button(
                     label="CSV 다운로드",
                     data=csv_bytes,
                     file_name=f"extracted_table_p{selected_page}.csv",
-                    mime="text/csv"
+                    mime="text/csv",
                 )
 
                 st.download_button(
                     label="TSV 다운로드",
                     data=tsv_text.encode("utf-8-sig"),
                     file_name=f"extracted_table_p{selected_page}.tsv",
-                    mime="text/tab-separated-values"
+                    mime="text/tab-separated-values",
                 )
 
 st.divider()
 st.markdown(
     """
-### 이 앱이 잘하는 것
-- 텍스트형 PDF에서 키워드가 포함된 페이지 찾기
-- 해당 페이지의 표 자동 추출
-- 엑셀 붙여넣기용 TSV 변환
+### 추천 키워드 예시
+- Balance Sheet: balance sheets / assets / total assets / retained earnings
+- Income Statement: statements of operations / revenue / gross profit / net income
+- Cash Flow: statements of cash flows / operating activities / investing activities / financing activities
 
 ### 한계
-- 스캔본 PDF(이미지형)는 기본 `pdfplumber`만으로는 추출이 잘 안 될 수 있음
-- 표 선이 없거나 깨진 PDF는 후처리가 더 필요할 수 있음
-
-### 다음 단계 추천
-1. OCR 추가 (`pytesseract` 또는 `ocrmypdf`)
-2. 여러 페이지 연속 표 병합
-3. 표 유형별 자동 정규화 (예: 손익계산서 / 운영관수 / 국가별 표)
-4. 사용자가 원하는 출력 포맷 preset 추가
+- 스캔본 PDF는 OCR 보강이 필요할 수 있음
+- 표 구조가 매우 복잡한 경우 맞춤 파서가 더 잘 맞을 수 있음
 """
 )
 
 # 실행 예시
-# streamlit run app.py
+# streamlit run main.py
