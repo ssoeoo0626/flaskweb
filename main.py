@@ -192,7 +192,10 @@ with st.sidebar:
     st.header("설정")
     keyword_input = st.text_area(
         "키워드 입력",
-        value="balance sheets\nassets\ntotal assets\nretained earnings",
+        value="balance sheets
+assets
+total assets
+retained earnings",
         help="줄바꿈으로 여러 키워드를 넣어주세요. 예: revenue / EBITDA / screen / installations"
     )
     promote_header = st.checkbox("첫 행을 헤더로 승격", value=True)
@@ -243,7 +246,7 @@ if uploaded_file:
 
                 tsv_text = dataframe_to_tsv(result_df)
                 st.subheader("엑셀 붙여넣기용 TSV")
-                st.text_area("아래 내용을 복사해서 Excel에 붙여넣으세요", value=tsv_text, height=250)
+                st.code(tsv_text, language=None)
 
                 csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
                 st.download_button(
