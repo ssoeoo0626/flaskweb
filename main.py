@@ -192,10 +192,10 @@ with st.sidebar:
     st.header("설정")
     keyword_input = st.text_area(
         "키워드 입력",
-        value="balance sheets
+        value="""balance sheets
 assets
 total assets
-retained earnings",
+retained earnings""",
         help="줄바꿈으로 여러 키워드를 넣어주세요. 예: revenue / EBITDA / screen / installations"
     )
     promote_header = st.checkbox("첫 행을 헤더로 승격", value=True)
