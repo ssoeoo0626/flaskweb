@@ -10,9 +10,9 @@ import streamlit as st
 st.set_page_config(page_title="PDF 추출기 + 어닝콜 분석", layout="wide")
 
 
-# -----------------------------
+# =========================================================
 # 공통 유틸
-# -----------------------------
+# =========================================================
 def normalize_text(text: str) -> str:
     if text is None:
         return ""
@@ -26,9 +26,9 @@ def dataframe_to_tsv(df: pd.DataFrame) -> str:
     return df.to_csv(sep="\t", index=False)
 
 
-# -----------------------------
-# PDF 표 추출용 유틸
-# -----------------------------
+# =========================================================
+# PDF 표 추출 유틸
+# =========================================================
 def keyword_hit_score(text: str, keywords: List[str]) -> int:
     lowered = text.lower()
     return sum(1 for kw in keywords if kw.lower() in lowered)
@@ -56,6 +56,7 @@ def promote_first_row_to_header(df: pd.DataFrame) -> pd.DataFrame:
     if non_empty_ratio >= 0.5:
         new_cols = []
         seen = {}
+
         for i, col in enumerate(first_row):
             col = col if col else f"col_{i+1}"
             seen[col] = seen.get(col, 0) + 1
@@ -277,9 +278,9 @@ def filter_by_sector(result_df: pd.DataFrame, sector_keywords: List[str]) -> Dic
     return output
 
 
-# -----------------------------
+# =========================================================
 # 어닝콜 분석 유틸
-# -----------------------------
+# =========================================================
 DEFAULT_STOPWORDS = {
     "the", "and", "of", "to", "in", "a", "for", "on", "is", "that", "with", "as",
     "we", "our", "it", "this", "be", "are", "was", "were", "by", "from", "at",
@@ -330,16 +331,14 @@ def build_stopwords(custom_stopwords_text: str) -> set:
 def get_top_keywords(tokens: List[str], stopwords: set, min_len: int = 3, top_n: int = 20) -> pd.DataFrame:
     filtered = [t for t in tokens if len(t) >= min_len and t not in stopwords]
     counter = Counter(filtered)
-    df = pd.DataFrame(counter.most_common(top_n), columns=["keyword", "count"])
-    return df
+    return pd.DataFrame(counter.most_common(top_n), columns=["keyword", "count"])
 
 
 def get_top_bigrams(tokens: List[str], stopwords: set, min_len: int = 3, top_n: int = 20) -> pd.DataFrame:
     filtered = [t for t in tokens if len(t) >= min_len and t not in stopwords]
     bigrams = [" ".join([filtered[i], filtered[i + 1]]) for i in range(len(filtered) - 1)]
     counter = Counter(bigrams)
-    df = pd.DataFrame(counter.most_common(top_n), columns=["bigram", "count"])
-    return df
+    return pd.DataFrame(counter.most_common(top_n), columns=["bigram", "count"])
 
 
 def build_kwic(text: str, query: str, window: int = 80, limit: int = 20) -> pd.DataFrame:
@@ -360,16 +359,65 @@ def build_kwic(text: str, query: str, window: int = 80, limit: int = 20) -> pd.D
     return pd.DataFrame(matches)
 
 
-# -----------------------------
+def split_paragraphs(text: str) -> List[str]:
+    parts = re.split(r"\n\s*\n", text)
+    parts = [p.strip() for p in parts if p.strip()]
+    return parts
+
+
+def summarize_paragraph(paragraph: str, stopwords: set, max_sentences: int = 2) -> str:
+    sentences = re.split(r"(?<=[\.\?\!])\s+", paragraph.replace("\n", " "))
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    if not sentences:
+        return ""
+
+    tokens = tokenize_english_text(paragraph)
+    freq = Counter([t for t in tokens if t not in stopwords and len(t) >= 3])
+
+    scored = []
+    for sent in sentences:
+        sent_tokens = tokenize_english_text(sent)
+        score = sum(freq.get(tok, 0) for tok in sent_tokens)
+        scored.append((score, sent))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_sentences = [s for _, s in scored[:max_sentences]]
+
+    ordered = [s for s in sentences if s in top_sentences]
+    return " ".join(ordered)
+
+
+def build_paragraph_summary_df(text: str, stopwords: set, max_paragraphs: int = 30) -> pd.DataFrame:
+    paragraphs = split_paragraphs(text)
+
+    rows = []
+    for i, para in enumerate(paragraphs[:max_paragraphs], start=1):
+        summary = summarize_paragraph(para, stopwords, max_sentences=2)
+        token_count = len(tokenize_english_text(para))
+
+        rows.append(
+            {
+                "paragraph_no": i,
+                "summary": summary,
+                "original_text": para,
+                "token_count": token_count,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# =========================================================
 # 세션 상태
-# -----------------------------
+# =========================================================
 if "show_sector_box" not in st.session_state:
     st.session_state.show_sector_box = False
 
 
-# -----------------------------
+# =========================================================
 # 탭 구성
-# -----------------------------
+# =========================================================
 tab_pdf, tab_earnings = st.tabs(["PDF 표 추출", "어닝콜 키워드 분석"])
 
 
@@ -507,28 +555,20 @@ retained earnings""",
                         key="pdf_csv_download",
                     )
 
-                    st.download_button(
-                        label="TSV 다운로드",
-                        data=tsv_text.encode("utf-8-sig"),
-                        file_name=f"extracted_table_p{selected_page}.tsv",
-                        mime="text/tab-separated-values",
-                        key="pdf_tsv_download",
-                    )
-
 
 # =========================================================
-# 탭 2: 어닝콜 키워드 분석
+# 탭 2: 어닝콜 키워드 분석 + 문단별 요약
 # =========================================================
 with tab_earnings:
-    st.title("어닝콜 키워드 분석 대시보드")
-    st.caption("텍스트를 붙여넣거나 transcript 파일을 올리면 자주 나온 키워드와 구문을 분석합니다.")
+    st.title("어닝콜 키워드 분석")
+    st.caption("텍스트를 붙여넣거나 transcript 파일을 올리면 키워드/구문/문단별 요약을 볼 수 있습니다.")
 
     col1, col2 = st.columns([1, 1])
 
     with col1:
         transcript_text = st.text_area(
             "어닝콜 텍스트 붙여넣기",
-            height=300,
+            height=320,
             placeholder="여기에 earnings call transcript를 붙여넣으세요.",
             key="earnings_text_input",
         )
@@ -542,19 +582,19 @@ with tab_earnings:
 
         custom_stopwords_text = st.text_area(
             "추가 불용어",
-            value="""amc
-company
+            value="""operator
+question
+answer
 quarter
 year
-operator
-question
-answer""",
-            help="줄바꿈으로 추가 불용어를 넣으세요.",
+company""",
+            help="줄바꿈으로 추가 불용어를 입력하세요.",
             key="earnings_stopwords",
         )
 
         min_word_len = st.slider("최소 단어 길이", 2, 8, 3, key="earnings_min_word_len")
         top_n = st.slider("Top N", 10, 50, 20, key="earnings_top_n")
+        max_paragraphs = st.slider("문단 요약 개수", 5, 50, 20, key="earnings_max_paragraphs")
 
     file_text = extract_text_from_uploaded_doc(transcript_file) if transcript_file else ""
     full_text = transcript_text.strip() if transcript_text.strip() else file_text.strip()
@@ -569,13 +609,13 @@ answer""",
         kpi1, kpi2, kpi3 = st.columns(3)
         kpi1.metric("총 토큰 수", f"{len(tokens):,}")
         kpi2.metric("고유 토큰 수", f"{len(set(tokens)):,}")
-        kpi3.metric("문자 수", f"{len(full_text):,}")
+        kpi3.metric("문단 수", f"{len(split_paragraphs(full_text)):,}")
 
         st.divider()
 
-        chart_col1, chart_col2 = st.columns(2)
+        left, right = st.columns(2)
 
-        with chart_col1:
+        with left:
             st.subheader("Top Keywords")
             if keyword_df.empty:
                 st.info("추출된 키워드가 없습니다.")
@@ -583,13 +623,32 @@ answer""",
                 st.bar_chart(keyword_df.set_index("keyword"))
                 st.dataframe(keyword_df, use_container_width=True)
 
-        with chart_col2:
+        with right:
             st.subheader("Top Bigrams")
             if bigram_df.empty:
                 st.info("추출된 bigram이 없습니다.")
             else:
                 st.bar_chart(bigram_df.set_index("bigram"))
                 st.dataframe(bigram_df, use_container_width=True)
+
+        st.divider()
+
+        st.subheader("문단별 요약")
+        paragraph_summary_df = build_paragraph_summary_df(
+            full_text,
+            stopwords,
+            max_paragraphs=max_paragraphs
+        )
+
+        if paragraph_summary_df.empty:
+            st.info("문단 요약을 만들지 못했습니다.")
+        else:
+            for row in paragraph_summary_df.itertuples(index=False):
+                with st.expander(f"문단 {row.paragraph_no} | 토큰 {row.token_count}개"):
+                    st.markdown("요약")
+                    st.write(row.summary if row.summary else "(요약 생성 실패)")
+                    st.markdown("원문")
+                    st.write(row.original_text)
 
         st.divider()
 
@@ -612,5 +671,6 @@ answer""",
 
         with st.expander("원문 전체 보기"):
             st.text(full_text[:50000])
+
     else:
         st.info("텍스트를 붙여넣거나 txt/pdf transcript 파일을 업로드하세요.")
