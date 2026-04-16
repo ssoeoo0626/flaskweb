@@ -1,16 +1,17 @@
 import io
 import re
+from collections import Counter
 from typing import List, Dict, Tuple, Optional
 
 import pandas as pd
 import pdfplumber
 import streamlit as st
 
-st.set_page_config(page_title="PDF 키워드 기반 표 추출기", layout="wide")
+st.set_page_config(page_title="PDF 추출기 + 어닝콜 분석", layout="wide")
 
 
 # -----------------------------
-# 유틸
+# 공통 유틸
 # -----------------------------
 def normalize_text(text: str) -> str:
     if text is None:
@@ -21,6 +22,13 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+def dataframe_to_tsv(df: pd.DataFrame) -> str:
+    return df.to_csv(sep="\t", index=False)
+
+
+# -----------------------------
+# PDF 표 추출용 유틸
+# -----------------------------
 def keyword_hit_score(text: str, keywords: List[str]) -> int:
     lowered = text.lower()
     return sum(1 for kw in keywords if kw.lower() in lowered)
@@ -62,13 +70,6 @@ def promote_first_row_to_header(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def dataframe_to_tsv(df: pd.DataFrame) -> str:
-    return df.to_csv(sep="\t", index=False)
-
-
-# -----------------------------
-# PDF 분석
-# -----------------------------
 def extract_page_text(page) -> str:
     text = page.extract_text() or ""
     return normalize_text(text)
@@ -127,12 +128,11 @@ def find_candidate_pages(pdf_file, keywords: List[str]) -> List[Dict]:
             score = keyword_hit_score(text, keywords)
 
             if score > 0:
-                snippet = text[:500]
                 results.append(
                     {
                         "page_number": idx + 1,
                         "score": score,
-                        "snippet": snippet,
+                        "snippet": text[:500],
                     }
                 )
 
@@ -141,10 +141,6 @@ def find_candidate_pages(pdf_file, keywords: List[str]) -> List[Dict]:
 
 
 def parse_text_table_from_page(page, keywords: List[str]) -> Optional[pd.DataFrame]:
-    """
-    표 선 기반 추출 실패 시, 텍스트 줄에서
-    '계정명 + 숫자 2개' 구조를 직접 파싱하는 fallback
-    """
     text = extract_page_text(page)
     lines = [line.strip() for line in text.split("\n") if line.strip()]
 
@@ -208,7 +204,6 @@ def extract_best_table_from_page(
     with pdfplumber.open(pdf_file) as pdf:
         page = pdf.pages[page_number - 1]
 
-        # 1차: 표 인식
         tables = extract_tables_from_page(page)
 
         scored = []
@@ -225,7 +220,6 @@ def extract_best_table_from_page(
         if scored and scored[0][0] > 0:
             return scored[0][1], [x[1] for x in scored]
 
-        # 2차: 텍스트 fallback
         fallback_df = parse_text_table_from_page(page, keywords)
         if fallback_df is not None:
             return fallback_df, [fallback_df]
@@ -244,6 +238,7 @@ def try_merge_tables_vertically(tables: List[pd.DataFrame]) -> pd.DataFrame:
 
     base_cols = list(normalized[0].columns)
     aligned = []
+
     for df in normalized:
         if len(df.columns) == len(base_cols):
             copied = df.copy()
@@ -254,16 +249,12 @@ def try_merge_tables_vertically(tables: List[pd.DataFrame]) -> pd.DataFrame:
 
     try:
         merged = pd.concat(aligned, ignore_index=True)
-        merged = clean_table(merged)
-        return merged
+        return clean_table(merged)
     except Exception:
         return normalized[0]
 
 
 def filter_by_sector(result_df: pd.DataFrame, sector_keywords: List[str]) -> Dict[str, pd.DataFrame]:
-    """
-    section/account 컬럼을 기준으로 sector keyword 포함 여부로 분류
-    """
     output = {}
 
     if result_df.empty:
@@ -287,6 +278,89 @@ def filter_by_sector(result_df: pd.DataFrame, sector_keywords: List[str]) -> Dic
 
 
 # -----------------------------
+# 어닝콜 분석 유틸
+# -----------------------------
+DEFAULT_STOPWORDS = {
+    "the", "and", "of", "to", "in", "a", "for", "on", "is", "that", "with", "as",
+    "we", "our", "it", "this", "be", "are", "was", "were", "by", "from", "at",
+    "have", "has", "had", "will", "would", "can", "could", "should", "may",
+    "an", "or", "not", "but", "if", "so", "than", "then", "into", "about",
+    "you", "your", "they", "their", "them", "he", "she", "his", "her",
+    "operator", "question", "questions", "answer", "thanks", "thank",
+    "quarter", "year", "years", "good", "morning", "afternoon", "evening",
+    "hello", "please", "okay", "yeah", "uh", "um", "really", "think",
+    "company", "business"
+}
+
+
+def extract_text_from_uploaded_doc(uploaded_file) -> str:
+    if uploaded_file is None:
+        return ""
+
+    file_name = uploaded_file.name.lower()
+    file_bytes = uploaded_file.read()
+
+    if file_name.endswith(".txt"):
+        try:
+            return file_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return file_bytes.decode("cp949", errors="ignore")
+
+    if file_name.endswith(".pdf"):
+        texts = []
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                texts.append(page.extract_text() or "")
+        return "\n".join(texts)
+
+    return ""
+
+
+def tokenize_english_text(text: str) -> List[str]:
+    text = text.lower()
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z\-']{1,}", text)
+    return tokens
+
+
+def build_stopwords(custom_stopwords_text: str) -> set:
+    custom_words = {w.strip().lower() for w in custom_stopwords_text.splitlines() if w.strip()}
+    return DEFAULT_STOPWORDS | custom_words
+
+
+def get_top_keywords(tokens: List[str], stopwords: set, min_len: int = 3, top_n: int = 20) -> pd.DataFrame:
+    filtered = [t for t in tokens if len(t) >= min_len and t not in stopwords]
+    counter = Counter(filtered)
+    df = pd.DataFrame(counter.most_common(top_n), columns=["keyword", "count"])
+    return df
+
+
+def get_top_bigrams(tokens: List[str], stopwords: set, min_len: int = 3, top_n: int = 20) -> pd.DataFrame:
+    filtered = [t for t in tokens if len(t) >= min_len and t not in stopwords]
+    bigrams = [" ".join([filtered[i], filtered[i + 1]]) for i in range(len(filtered) - 1)]
+    counter = Counter(bigrams)
+    df = pd.DataFrame(counter.most_common(top_n), columns=["bigram", "count"])
+    return df
+
+
+def build_kwic(text: str, query: str, window: int = 80, limit: int = 20) -> pd.DataFrame:
+    if not query.strip():
+        return pd.DataFrame(columns=["context"])
+
+    matches = []
+    pattern = re.compile(re.escape(query), re.IGNORECASE)
+
+    for m in pattern.finditer(text):
+        start = max(0, m.start() - window)
+        end = min(len(text), m.end() + window)
+        context = text[start:end].replace("\n", " ")
+        matches.append({"context": context})
+        if len(matches) >= limit:
+            break
+
+    return pd.DataFrame(matches)
+
+
+# -----------------------------
 # 세션 상태
 # -----------------------------
 if "show_sector_box" not in st.session_state:
@@ -294,157 +368,249 @@ if "show_sector_box" not in st.session_state:
 
 
 # -----------------------------
-# UI
+# 탭 구성
 # -----------------------------
-st.title("PDF 키워드 기반 표 추출기")
-st.caption("PDF를 올리고 키워드를 넣으면 관련 페이지를 찾고, 표를 뽑아 TSV로 복사할 수 있습니다.")
+tab_pdf, tab_earnings = st.tabs(["PDF 표 추출", "어닝콜 키워드 분석"])
 
-with st.sidebar:
-    st.header("설정")
 
-    keyword_input = st.text_area(
-        "키워드 입력",
-        value="""balance sheets
+# =========================================================
+# 탭 1: PDF 표 추출
+# =========================================================
+with tab_pdf:
+    st.title("PDF 키워드 기반 표 추출기")
+    st.caption("PDF를 올리고 키워드를 넣으면 관련 페이지를 찾고, 표를 뽑아 TSV로 복사할 수 있습니다.")
+
+    with st.sidebar:
+        st.header("PDF 추출 설정")
+
+        keyword_input = st.text_area(
+            "키워드 입력",
+            value="""balance sheets
 assets
 total assets
 retained earnings""",
-        help="줄바꿈으로 여러 키워드를 넣어주세요. 예: balance sheets / revenue / operating activities",
-    )
-
-    promote_header = st.checkbox("첫 행을 헤더로 승격", value=True)
-    allow_multi_merge = st.checkbox("후보 표 여러 개 세로 병합 시도", value=False)
-
-    st.divider()
-
-    if st.button("섹터 설정"):
-        st.session_state.show_sector_box = not st.session_state.show_sector_box
-
-    sector_keywords = []
-    if st.session_state.show_sector_box:
-        sector_mode = st.selectbox(
-            "섹터 프리셋",
-            ["직접 입력", "재무제표", "손익계산서", "현금흐름표"]
+            help="줄바꿈으로 여러 키워드를 넣어주세요. 예: balance sheets / revenue / operating activities",
+            key="pdf_keyword_input",
         )
 
-        preset_map = {
-            "재무제표": ["assets", "liabilities", "equity"],
-            "손익계산서": ["revenue", "gross profit", "operating income", "net income"],
-            "현금흐름표": ["operating activities", "investing activities", "financing activities"],
-        }
+        promote_header = st.checkbox("첫 행을 헤더로 승격", value=True, key="pdf_promote_header")
+        allow_multi_merge = st.checkbox("후보 표 여러 개 세로 병합 시도", value=False, key="pdf_allow_merge")
 
-        default_sector_text = ""
-        if sector_mode in preset_map:
-            default_sector_text = "\n".join(preset_map[sector_mode])
+        st.divider()
 
-        sector_text = st.text_area(
-            "섹터 입력",
-            value=default_sector_text,
-            help="줄바꿈으로 섹터 키워드를 입력하세요."
-        )
-        sector_keywords = [x.strip() for x in sector_text.splitlines() if x.strip()]
+        if st.button("섹터 설정", key="pdf_sector_button"):
+            st.session_state.show_sector_box = not st.session_state.show_sector_box
 
-uploaded_file = st.file_uploader("PDF 업로드", type=["pdf"])
+        sector_keywords = []
+        if st.session_state.show_sector_box:
+            sector_mode = st.selectbox(
+                "섹터 프리셋",
+                ["직접 입력", "재무제표", "손익계산서", "현금흐름표"],
+                key="pdf_sector_mode",
+            )
 
-if uploaded_file:
-    keywords = [k.strip() for k in keyword_input.splitlines() if k.strip()]
+            preset_map = {
+                "재무제표": ["assets", "liabilities", "equity"],
+                "손익계산서": ["revenue", "gross profit", "operating income", "net income"],
+                "현금흐름표": ["operating activities", "investing activities", "financing activities"],
+            }
 
-    if not keywords:
-        st.warning("키워드를 1개 이상 넣어주세요.")
-    else:
-        pdf_bytes = uploaded_file.read()
+            default_sector_text = ""
+            if sector_mode in preset_map:
+                default_sector_text = "\n".join(preset_map[sector_mode])
 
-        with st.spinner("PDF를 분석 중입니다..."):
-            candidate_pages = find_candidate_pages(io.BytesIO(pdf_bytes), keywords)
+            sector_text = st.text_area(
+                "섹터 입력",
+                value=default_sector_text,
+                help="줄바꿈으로 섹터 키워드를 입력하세요.",
+                key="pdf_sector_text",
+            )
+            sector_keywords = [x.strip() for x in sector_text.splitlines() if x.strip()]
 
-        if not candidate_pages:
-            st.error("입력한 키워드가 포함된 페이지를 찾지 못했습니다.")
+    uploaded_file = st.file_uploader("PDF 업로드", type=["pdf"], key="pdf_uploader")
+
+    if uploaded_file:
+        keywords = [k.strip() for k in keyword_input.splitlines() if k.strip()]
+
+        if not keywords:
+            st.warning("키워드를 1개 이상 넣어주세요.")
         else:
-            st.subheader("키워드가 잡힌 페이지")
-            candidate_df = pd.DataFrame(candidate_pages)
-            st.dataframe(candidate_df, use_container_width=True)
+            pdf_bytes = uploaded_file.read()
 
-            page_options = [
-                f"p.{row['page_number']} | score={row['score']}"
-                for _, row in candidate_df.iterrows()
-            ]
-            selected_label = st.selectbox("분석할 페이지 선택", page_options)
-            selected_page = int(re.search(r"p\.(\d+)", selected_label).group(1))
+            with st.spinner("PDF를 분석 중입니다..."):
+                candidate_pages = find_candidate_pages(io.BytesIO(pdf_bytes), keywords)
 
-            with st.spinner("표를 추출 중입니다..."):
-                best_df, all_tables = extract_best_table_from_page(
-                    io.BytesIO(pdf_bytes),
-                    selected_page,
-                    keywords,
-                )
-
-            if best_df is None:
-                st.warning("이 페이지에서 표 선 기반 추출은 실패했고, 텍스트 파싱으로도 적절한 표를 만들지 못했습니다.")
+            if not candidate_pages:
+                st.error("입력한 키워드가 포함된 페이지를 찾지 못했습니다.")
             else:
-                if allow_multi_merge and len(all_tables) >= 2:
-                    result_df = try_merge_tables_vertically(all_tables)
+                st.subheader("키워드가 잡힌 페이지")
+                candidate_df = pd.DataFrame(candidate_pages)
+                st.dataframe(candidate_df, use_container_width=True)
+
+                page_options = [
+                    f"p.{row['page_number']} | score={row['score']}"
+                    for _, row in candidate_df.iterrows()
+                ]
+                selected_label = st.selectbox("분석할 페이지 선택", page_options, key="pdf_page_select")
+                selected_page = int(re.search(r"p\.(\d+)", selected_label).group(1))
+
+                with st.spinner("표를 추출 중입니다..."):
+                    best_df, all_tables = extract_best_table_from_page(
+                        io.BytesIO(pdf_bytes),
+                        selected_page,
+                        keywords,
+                    )
+
+                if best_df is None:
+                    st.warning("이 페이지에서 표 선 기반 추출은 실패했고, 텍스트 파싱으로도 적절한 표를 만들지 못했습니다.")
                 else:
-                    result_df = best_df.copy()
+                    if allow_multi_merge and len(all_tables) >= 2:
+                        result_df = try_merge_tables_vertically(all_tables)
+                    else:
+                        result_df = best_df.copy()
 
-                if promote_header:
-                    result_df = promote_first_row_to_header(result_df)
+                    if promote_header:
+                        result_df = promote_first_row_to_header(result_df)
 
-                result_df = clean_table(result_df)
+                    result_df = clean_table(result_df)
 
-                st.subheader("추출 결과")
+                    st.subheader("추출 결과")
 
-                # 섹터 탭
-                if sector_keywords:
-                    sector_map = filter_by_sector(result_df, sector_keywords)
-                    tab_names = ["전체"] + sector_keywords
-                    tabs = st.tabs(tab_names)
+                    if sector_keywords:
+                        sector_map = filter_by_sector(result_df, sector_keywords)
+                        tab_names = ["전체"] + sector_keywords
+                        result_tabs = st.tabs(tab_names)
 
-                    with tabs[0]:
+                        with result_tabs[0]:
+                            st.dataframe(result_df, use_container_width=True)
+
+                        for i, sector in enumerate(sector_keywords, start=1):
+                            with result_tabs[i]:
+                                sector_df = sector_map.get(sector, pd.DataFrame())
+                                if sector_df.empty:
+                                    st.info(f"'{sector}' 키워드로 분류된 행이 없습니다.")
+                                else:
+                                    st.dataframe(sector_df, use_container_width=True)
+                    else:
                         st.dataframe(result_df, use_container_width=True)
 
-                    for i, sector in enumerate(sector_keywords, start=1):
-                        with tabs[i]:
-                            sector_df = sector_map.get(sector, pd.DataFrame())
-                            if sector_df.empty:
-                                st.info(f"'{sector}' 키워드로 분류된 행이 없습니다.")
-                            else:
-                                st.dataframe(sector_df, use_container_width=True)
-                else:
-                    st.dataframe(result_df, use_container_width=True)
+                    tsv_text = dataframe_to_tsv(result_df)
+                    st.subheader("엑셀 붙여넣기용 TSV")
+                    st.code(tsv_text, language=None)
 
-                tsv_text = dataframe_to_tsv(result_df)
-                st.subheader("엑셀 붙여넣기용 TSV")
-                st.code(tsv_text, language=None)
+                    csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        label="CSV 다운로드",
+                        data=csv_bytes,
+                        file_name=f"extracted_table_p{selected_page}.csv",
+                        mime="text/csv",
+                        key="pdf_csv_download",
+                    )
 
-                csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    label="CSV 다운로드",
-                    data=csv_bytes,
-                    file_name=f"extracted_table_p{selected_page}.csv",
-                    mime="text/csv",
-                )
+                    st.download_button(
+                        label="TSV 다운로드",
+                        data=tsv_text.encode("utf-8-sig"),
+                        file_name=f"extracted_table_p{selected_page}.tsv",
+                        mime="text/tab-separated-values",
+                        key="pdf_tsv_download",
+                    )
 
-                st.download_button(
-                    label="TSV 다운로드",
-                    data=tsv_text.encode("utf-8-sig"),
-                    file_name=f"extracted_table_p{selected_page}.tsv",
-                    mime="text/tab-separated-values",
-                )
 
-st.divider()
-st.markdown(
-    """
-### 이 앱이 잘하는 것
-- 텍스트형 PDF에서 키워드가 포함된 페이지 찾기
-- 해당 페이지의 표 자동 추출
-- 표 추출 실패 시 텍스트 fallback 파싱
-- 엑셀 붙여넣기용 TSV 복사
-- 섹터 키워드로 결과 탭 분리
+# =========================================================
+# 탭 2: 어닝콜 키워드 분석
+# =========================================================
+with tab_earnings:
+    st.title("어닝콜 키워드 분석 대시보드")
+    st.caption("텍스트를 붙여넣거나 transcript 파일을 올리면 자주 나온 키워드와 구문을 분석합니다.")
 
-### 한계
-- 스캔본 PDF(이미지형)는 기본 pdfplumber만으로는 추출이 어려울 수 있음
-- 표 구조가 매우 복잡하면 맞춤 파서가 더 잘 맞을 수 있음
-"""
-)
+    col1, col2 = st.columns([1, 1])
 
-# 실행 예시
-# streamlit run main.py
+    with col1:
+        transcript_text = st.text_area(
+            "어닝콜 텍스트 붙여넣기",
+            height=300,
+            placeholder="여기에 earnings call transcript를 붙여넣으세요.",
+            key="earnings_text_input",
+        )
+
+    with col2:
+        transcript_file = st.file_uploader(
+            "또는 transcript 파일 업로드 (txt/pdf)",
+            type=["txt", "pdf"],
+            key="earnings_file_uploader",
+        )
+
+        custom_stopwords_text = st.text_area(
+            "추가 불용어",
+            value="""amc
+company
+quarter
+year
+operator
+question
+answer""",
+            help="줄바꿈으로 추가 불용어를 넣으세요.",
+            key="earnings_stopwords",
+        )
+
+        min_word_len = st.slider("최소 단어 길이", 2, 8, 3, key="earnings_min_word_len")
+        top_n = st.slider("Top N", 10, 50, 20, key="earnings_top_n")
+
+    file_text = extract_text_from_uploaded_doc(transcript_file) if transcript_file else ""
+    full_text = transcript_text.strip() if transcript_text.strip() else file_text.strip()
+
+    if full_text:
+        stopwords = build_stopwords(custom_stopwords_text)
+        tokens = tokenize_english_text(full_text)
+
+        keyword_df = get_top_keywords(tokens, stopwords, min_len=min_word_len, top_n=top_n)
+        bigram_df = get_top_bigrams(tokens, stopwords, min_len=min_word_len, top_n=top_n)
+
+        kpi1, kpi2, kpi3 = st.columns(3)
+        kpi1.metric("총 토큰 수", f"{len(tokens):,}")
+        kpi2.metric("고유 토큰 수", f"{len(set(tokens)):,}")
+        kpi3.metric("문자 수", f"{len(full_text):,}")
+
+        st.divider()
+
+        chart_col1, chart_col2 = st.columns(2)
+
+        with chart_col1:
+            st.subheader("Top Keywords")
+            if keyword_df.empty:
+                st.info("추출된 키워드가 없습니다.")
+            else:
+                st.bar_chart(keyword_df.set_index("keyword"))
+                st.dataframe(keyword_df, use_container_width=True)
+
+        with chart_col2:
+            st.subheader("Top Bigrams")
+            if bigram_df.empty:
+                st.info("추출된 bigram이 없습니다.")
+            else:
+                st.bar_chart(bigram_df.set_index("bigram"))
+                st.dataframe(bigram_df, use_container_width=True)
+
+        st.divider()
+
+        st.subheader("복사용 Top Keywords")
+        if not keyword_df.empty:
+            keyword_lines = "\n".join(
+                [f"{row.keyword}\t{row.count}" for row in keyword_df.itertuples(index=False)]
+            )
+            st.code(keyword_lines, language=None)
+
+        st.subheader("원문 검색")
+        search_query = st.text_input("찾을 단어/문구", key="earnings_search_query")
+
+        if search_query.strip():
+            kwic_df = build_kwic(full_text, search_query, window=100, limit=30)
+            if kwic_df.empty:
+                st.info("검색 결과가 없습니다.")
+            else:
+                st.dataframe(kwic_df, use_container_width=True)
+
+        with st.expander("원문 전체 보기"):
+            st.text(full_text[:50000])
+    else:
+        st.info("텍스트를 붙여넣거나 txt/pdf transcript 파일을 업로드하세요.")
